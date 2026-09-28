@@ -102,11 +102,10 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-fn cors_layer(origins: &[String]) -> CorsLayer {
-    use axum::http::{header, HeaderValue, Method};
-    let values: Vec<HeaderValue> = origins.iter().filter_map(|origin| origin.parse().ok()).collect();
+fn cors_layer(_origins: &[String]) -> CorsLayer {
+    use axum::http::{header, Method};
     CorsLayer::new()
-        .allow_origin(tower_http::cors::AllowOrigin::list(values))
+        .allow_origin(tower_http::cors::Any)
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
 }
