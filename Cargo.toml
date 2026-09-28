@@ -2,6 +2,11 @@
 name = "guitar-server"
 version = "0.1.0"
 edition = "2024"
+autobins = false
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }
@@ -17,9 +22,8 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-resend-rs = "0.18"
 dotenvy = "0.15"
-time = { version = "0.3", features = ["formatting", "parsing"] }
+time = { version = "=0.3.45", features = ["formatting", "parsing"] }
 
 [profile.release]
 opt-level = "z"

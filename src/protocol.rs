@@ -46,6 +46,8 @@ pub enum ClientMessage {
         final_score: u32,
         max_combo: u32,
         accuracy: f32,
+        hits: u32,
+        total_notes: u32,
         checksum: String,
     },
     RequestRematch,

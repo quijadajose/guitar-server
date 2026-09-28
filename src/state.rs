@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use rand::{distributions::Alphanumeric, Rng};
 use std::{
     sync::{
-        atomic::Ordering,
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 pub const MAX_ROOMS: usize = 64;
+pub const MAX_SOCKETS: usize = 128;
 const EMPTY_ROOM_SECS: u64 = 120;
 const IDLE_ROOM_SECS: u64 = 600;
 const WARN_LEAD_SECS: u64 = 60;
@@ -26,6 +27,7 @@ pub type RoomMap = Arc<DashMap<String, RoomHandle>>;
 pub struct AppState {
     pub rooms: RoomMap,
     pub auth: AuthState,
+    sockets: Arc<AtomicUsize>,
 }
 
 impl FromRef<AppState> for AuthState {
@@ -39,7 +41,25 @@ impl AppState {
         Self {
             rooms: Arc::new(DashMap::new()),
             auth,
+            sockets: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn try_acquire_socket(&self) -> bool {
+        let mut current = self.sockets.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_SOCKETS {
+                return false;
+            }
+            match self.sockets.compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub fn release_socket(&self) {
+        self.sockets.fetch_sub(1, Ordering::AcqRel);
     }
 
     pub fn generate_room_code(&self) -> String {

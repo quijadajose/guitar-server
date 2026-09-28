@@ -66,13 +66,6 @@ pub async fn limit_auth(
 }
 
 #[derive(Deserialize)]
-pub struct SignupBody {
-    pub email: String,
-    pub password: String,
-    pub redirect_to: Option<String>,
-}
-
-#[derive(Deserialize)]
 pub struct EmailBody {
     pub email: String,
     pub redirect_to: Option<String>,
@@ -81,46 +74,6 @@ pub struct EmailBody {
 struct IssuedLink {
     action_link: String,
     user_id: Option<String>,
-}
-
-pub async fn signup(State(auth): State<AuthState>, Json(body): Json<SignupBody>) -> impl IntoResponse {
-    let email = body.email.trim().to_lowercase();
-    if !valid_email(&email) || body.password.len() < 6 {
-        return err(StatusCode::BAD_REQUEST, "Email y contraseña de al menos 6 caracteres.");
-    }
-    let redirect = match resolve_redirect(body.redirect_to.as_deref(), &auth.config) {
-        Ok(redirect) => redirect,
-        Err(()) => return err(StatusCode::BAD_REQUEST, "El retorno del enlace no está permitido."),
-    };
-
-    let issued = match generate_link(&auth, "signup", &email, Some(&body.password), &redirect).await {
-        Ok(issued) => issued,
-        Err(()) => return err(StatusCode::BAD_REQUEST, "No se pudo crear la cuenta."),
-    };
-    let html = mail_html(
-        "Confirmá tu cuenta de Guitar VS.",
-        &issued.action_link,
-        "Confirmar email",
-    );
-    if auth.mailer.send_html(&email, "Confirmá tu cuenta", &html).await.is_err() {
-        if let Some(id) = issued.user_id.as_deref() {
-            let _ = delete_auth_user(&auth, id).await;
-        }
-        return err(StatusCode::BAD_GATEWAY, "No se pudo enviar el email. La cuenta no quedó creada.");
-    }
-    ok()
-}
-
-pub async fn recover(State(auth): State<AuthState>, Json(body): Json<EmailBody>) -> impl IntoResponse {
-    send_link(
-        auth,
-        "recovery",
-        body,
-        "Recuperar contraseña",
-        "Restablecé tu contraseña de Guitar VS.",
-        "Cambiar contraseña",
-    )
-    .await
 }
 
 pub async fn magic_link(State(auth): State<AuthState>, Json(body): Json<EmailBody>) -> impl IntoResponse {
@@ -174,7 +127,7 @@ async fn send_link(
         Ok(redirect) => redirect,
         Err(()) => return err(StatusCode::BAD_REQUEST, "El retorno del enlace no está permitido."),
     };
-    let issued = match generate_link(&auth, link_type, &email, None, &redirect).await {
+    let issued = match generate_link(&auth, link_type, &email, &redirect).await {
         Ok(issued) => issued,
         Err(()) => return ok(),
     };
@@ -189,17 +142,13 @@ async fn generate_link(
     auth: &AuthState,
     link_type: &str,
     email: &str,
-    password: Option<&str>,
     redirect: &str,
 ) -> Result<IssuedLink, ()> {
-    let mut payload = json!({
+    let payload = json!({
         "type": link_type,
         "email": email,
         "options": { "redirect_to": redirect }
     });
-    if let Some(password) = password {
-        payload["password"] = Value::String(password.to_string());
-    }
 
     let url = format!("{}/auth/v1/admin/generate_link", base_url(auth));
     let response = admin_request(auth, reqwest::Method::POST, &url)

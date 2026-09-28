@@ -66,6 +66,39 @@ fn allow(window: &mut Instant, count: &mut u32, limit: u32) -> bool {
     true
 }
 
+struct SongBudget {
+    events: u32,
+    points_per_hit: u32,
+}
+
+fn song_budget(song_id: &str) -> Option<SongBudget> {
+    match song_id {
+        "sultans_swing" => Some(SongBudget { events: 8, points_per_hit: 150 }),
+        "fur_elise" => Some(SongBudget { events: 130, points_per_hit: 150 }),
+        "chords_progression" => Some(SongBudget { events: 5, points_per_hit: 300 }),
+        _ => None,
+    }
+}
+
+fn fnv1a_hex(raw: &str) -> String {
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in raw.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{hash:08x}")
+}
+
+fn plain_name(value: &str) -> String {
+    let cleaned: String = value
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control() && *c != '<' && *c != '>' && *c != '&' && *c != '"' && *c != '\'')
+        .take(MAX_NAME_CHARS)
+        .collect();
+    if cleaned.is_empty() { "Player".to_string() } else { cleaned }
+}
+
 fn clip<'a>(value: &'a str, max_chars: usize) -> &'a str {
     match value.char_indices().nth(max_chars) {
         Some((idx, _)) => &value[..idx],
@@ -83,6 +116,14 @@ fn should_forward(msg: &ServerMessage, session_id: &str) -> bool {
             ..
         } => s != session_id,
         _ => true,
+    }
+}
+
+struct SocketPermit(AppState);
+
+impl Drop for SocketPermit {
+    fn drop(&mut self) {
+        self.0.release_socket();
     }
 }
 
@@ -144,6 +185,10 @@ pub async fn ws_handler(
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
+    if !state.try_acquire_socket() {
+        return;
+    }
+    let _permit = SocketPermit(state.clone());
     let (mut sender, mut receiver) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
     let writer = tokio::spawn(async move {
@@ -194,15 +239,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 is_public,
             } => {
                 let song_id = clip(song_id.trim(), MAX_SONG_ID_CHARS).to_string();
-                if song_id.is_empty() {
-                    emit_error(&out_tx, "song_id vacío").await;
+                if song_budget(&song_id).is_none() {
+                    emit_error(&out_tx, "canción no disponible para versus").await;
                     continue;
                 }
-                let player_name = {
-                    let trimmed = player_name.trim();
-                    let name = if trimmed.is_empty() { "Player" } else { trimmed };
-                    clip(name, MAX_NAME_CHARS).to_string()
-                };
+                let player_name = plain_name(&player_name);
 
                 let Some((code, room_handle)) = state
                     .create_room(
@@ -245,11 +286,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 player_name,
                 as_spectator,
             } => {
-                let player_name = {
-                    let trimmed = player_name.trim();
-                    let name = if trimmed.is_empty() { "Player" } else { trimmed };
-                    clip(name, MAX_NAME_CHARS).to_string()
-                };
+                let player_name = plain_name(&player_name);
                 let Some(room_handle) = state.get_room(&room_code) else {
                     emit_error(&out_tx, "Sala no encontrada o expirada").await;
                     continue;
@@ -340,8 +377,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     .as_ref()
                     .map(|h| h.session_id == session_id)
                     .unwrap_or(false);
-                if is_host {
+                let both_ready = room.host.as_ref().is_some_and(|h| h.ready)
+                    && room.guest.as_ref().is_some_and(|g| g.ready);
+                if is_host && both_ready {
                     room.is_playing = true;
+                    if let Some(ref mut h) = room.host {
+                        h.reset_match();
+                    }
+                    if let Some(ref mut g) = room.guest {
+                        g.reset_match();
+                    }
                     room.touch();
                     let countdown_ms = 3500;
                     let _ = room.tx.send(ServerMessage::GameStarting {
@@ -367,13 +412,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     continue;
                 };
                 let room = room_handle.read().await;
+                if !room.is_playing {
+                    continue;
+                }
                 room.touch();
+                let Some(budget) = song_budget(&room.song_id) else {
+                    continue;
+                };
+                let max_score = budget.events.saturating_mul(budget.points_per_hit).saturating_mul(4);
                 let _ = room.tx.send(ServerMessage::OpponentProgress {
                     session_id: session_id.clone(),
-                    score,
-                    combo,
-                    accuracy,
-                    measure,
+                    score: score.min(max_score),
+                    combo: combo.min(budget.events),
+                    accuracy: accuracy.clamp(0.0, 100.0),
+                    measure: measure.min(64),
                 });
             }
 
@@ -392,8 +444,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let Some(room_handle) = state.get_room(code) else {
                     continue;
                 };
-                let room = room_handle.read().await;
+                let mut room = room_handle.write().await;
+                if !room.is_playing {
+                    continue;
+                }
                 room.touch();
+                let events = song_budget(&room.song_id).map(|budget| budget.events).unwrap_or(0);
+                if let Some(ref mut h) = room.host {
+                    if h.session_id == session_id {
+                        h.register_note(note_id, &rating, events);
+                    }
+                }
+                if let Some(ref mut g) = room.guest {
+                    if g.session_id == session_id {
+                        g.register_note(note_id, &rating, events);
+                    }
+                }
                 let _ = room.tx.send(ServerMessage::OpponentNoteHit {
                     session_id: session_id.clone(),
                     note_id,
@@ -412,7 +478,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let Some(room_handle) = state.get_room(code) else {
                     continue;
                 };
-                let room = room_handle.read().await;
+                let mut room = room_handle.write().await;
+                if room.mode != crate::models::GameMode::FaceOff || !room.is_playing {
+                    continue;
+                }
+                let charged = if let Some(player) = room.host.as_mut().filter(|h| h.session_id == session_id) {
+                    player.try_spend_attack()
+                } else if let Some(player) = room.guest.as_mut().filter(|g| g.session_id == session_id) {
+                    player.try_spend_attack()
+                } else {
+                    false
+                };
+                if !charged {
+                    continue;
+                }
                 room.touch();
                 let _ = room.tx.send(ServerMessage::ApplyAttack {
                     from_session_id: session_id.clone(),
@@ -459,9 +538,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 final_score,
                 max_combo,
                 accuracy,
+                hits,
+                total_notes,
                 checksum,
             } => {
-                let checksum = clip(&checksum, MAX_CHECKSUM_CHARS).to_string();
+                let sanitized_checksum = clip(&checksum, MAX_CHECKSUM_CHARS).to_string();
+                let bounded_accuracy = accuracy.clamp(0.0, 100.0);
                 let Some(ref code) = current_room_code else {
                     continue;
                 };
@@ -470,18 +552,49 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 };
                 let mut room = room_handle.write().await;
                 room.touch();
+
+                let budget = song_budget(&room.song_id);
+                let expected = format!(
+                    "{}:{final_score}:{max_combo}:{accuracy:.1}:{hits}:{total_notes}",
+                    room.song_id
+                );
+                let checksum_ok = sanitized_checksum == fnv1a_hex(&expected);
+                let is_cheated = match budget {
+                    Some(budget) => {
+                        let max_score = budget.events.saturating_mul(budget.points_per_hit).saturating_mul(4);
+                        !checksum_ok
+                            || !accuracy.is_finite()
+                            || accuracy > 100.0
+                            || total_notes != budget.events
+                            || hits > budget.events
+                            || max_combo > budget.events
+                            || final_score > max_score
+                    }
+                    None => true,
+                };
+
                 if let Some(ref mut h) = room.host {
                     if h.session_id == session_id {
-                        h.score = final_score;
-                        h.combo = max_combo;
-                        h.accuracy = accuracy;
+                        h.score = if is_cheated { 0 } else { final_score };
+                        h.combo = if is_cheated { 0 } else { max_combo };
+                        h.accuracy = if is_cheated { 0.0 } else { bounded_accuracy };
+                        h.checksum = Some(sanitized_checksum.clone());
+                        h.is_disqualified = is_cheated;
+                        if is_cheated {
+                            warn!("Anti-cheat: Host session {} disqualified (score: {}, combo: {})", session_id, final_score, max_combo);
+                        }
                     }
                 }
                 if let Some(ref mut g) = room.guest {
                     if g.session_id == session_id {
-                        g.score = final_score;
-                        g.combo = max_combo;
-                        g.accuracy = accuracy;
+                        g.score = if is_cheated { 0 } else { final_score };
+                        g.combo = if is_cheated { 0 } else { max_combo };
+                        g.accuracy = if is_cheated { 0.0 } else { bounded_accuracy };
+                        g.checksum = Some(sanitized_checksum);
+                        g.is_disqualified = is_cheated;
+                        if is_cheated {
+                            warn!("Anti-cheat: Guest session {} disqualified (score: {}, combo: {})", session_id, final_score, max_combo);
+                        }
                     }
                 }
                 let _ = room.tx.send(ServerMessage::RoomUpdated {
@@ -508,4 +621,71 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
     drop(out_tx);
     writer.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::auth::{AuthConfig, AuthState, RateLimiter};
+    use crate::mail::Mailer;
+    use crate::models::GameMode;
+    use crate::protocol::ServerMessage;
+    use crate::state::AppState;
+    use std::sync::Arc;
+
+    fn test_state() -> AppState {
+        let auth = AuthState {
+            config: AuthConfig {
+                supabase_url: "https://example.supabase.co".into(),
+                service_key: "test".into(),
+                app_url: "http://localhost:5173".into(),
+                allowed_origins: vec!["http://localhost:5173".into()],
+                http: reqwest::Client::new(),
+            },
+            mailer: Arc::new(Mailer::new("test".into(), "onboarding@resend.dev".into())),
+            limiter: RateLimiter::default(),
+        };
+        AppState::new(auth)
+    }
+
+    #[test]
+    fn parses_create_room() {
+        let raw = r#"{"type":"create_room","payload":{"song_id":"fur_elise","mode":"classic","player_name":"Ana","is_public":false}}"#;
+        serde_json::from_str::<crate::protocol::ClientMessage>(raw).expect("parse");
+    }
+
+    #[tokio::test]
+    async fn two_players_share_a_note_hit() {
+        let state = test_state();
+        let (_code, room_handle) = state
+            .create_room(
+                "fur_elise".into(),
+                GameMode::Classic,
+                false,
+                "host-session".into(),
+                "Ana".into(),
+            )
+            .await
+            .expect("sala");
+        {
+            let mut room = room_handle.write().await;
+            room.add_player("guest-session".into(), "Luis".into(), false)
+                .expect("invitado");
+        }
+        let room = room_handle.read().await;
+        let mut guest_rx = room.tx.subscribe();
+        let hit = ServerMessage::OpponentNoteHit {
+            session_id: "host-session".into(),
+            note_id: 3,
+            rating: "perfect".into(),
+            cents_offset: 0,
+        };
+        room.tx.send(hit.clone()).expect("broadcast");
+        let received = guest_rx.recv().await.expect("nota");
+        assert!(super::should_forward(&received, "guest-session"));
+        assert!(!super::should_forward(&hit, "host-session"));
+        match received {
+            ServerMessage::OpponentNoteHit { note_id, .. } => assert_eq!(note_id, 3),
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+    }
 }

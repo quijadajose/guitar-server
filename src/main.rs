@@ -15,7 +15,7 @@ use std::{net::SocketAddr, time::Duration};
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt::init();
@@ -67,11 +67,25 @@ async fn main() {
         }
     });
 
-    let cors = cors_layer(&allowed_origins);
+    let app = router(state);
 
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    info!("Guitar multiplayer Server running on http://{} and ws://{}/ws", addr, addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .unwrap();
+}
+
+pub fn router(state: AppState) -> Router {
+    let allowed_origins = state.auth.config.allowed_origins.clone();
+    let cors = cors_layer(&allowed_origins);
     let auth_router = Router::new()
-        .route("/auth/signup", post(auth::signup))
-        .route("/auth/recover", post(auth::recover))
         .route("/auth/magic-link", post(auth::magic_link))
         .route(
             "/auth/account/deletion",
@@ -79,21 +93,13 @@ async fn main() {
         )
         .layer(middleware::from_fn_with_state(state.auth.clone(), auth::limit_auth));
 
-    let app = Router::new()
+    Router::new()
         .route("/health", get(handlers::health_check))
         .route("/rooms", get(handlers::public_rooms))
         .route("/ws", get(ws::ws_handler))
         .merge(auth_router)
         .layer(cors)
-        .with_state(state);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3001));
-    info!("Guitar multiplayer Server running on http://{} and ws://{}/ws", addr, addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .unwrap();
+        .with_state(state)
 }
 
 fn cors_layer(origins: &[String]) -> CorsLayer {
