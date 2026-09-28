@@ -24,11 +24,10 @@ async fn main() {
     let service_key = std::env::var("SUPABASE_SECRET_KEY").expect("SUPABASE_SECRET_KEY");
     let resend_key = std::env::var("RESEND_KEY").expect("RESEND_KEY");
     let resend_from = std::env::var("RESEND_FROM").unwrap_or_else(|_| "onboarding@resend.dev".into());
-    let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:5173".into());
+    let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "https://quijadajose.github.io".into());
     let mut allowed_origins = vec![
         app_url.clone(),
-        "http://localhost:5173".into(),
-        "http://127.0.0.1:5173".into(),
+        "https://quijadajose.github.io".into(),
     ];
     if let Ok(extra) = std::env::var("CORS_ORIGINS") {
         allowed_origins.extend(extra.split(',').map(|item| item.trim().to_string()).filter(|item| !item.is_empty()));
@@ -102,10 +101,11 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-fn cors_layer(_origins: &[String]) -> CorsLayer {
-    use axum::http::{header, Method};
+fn cors_layer(origins: &[String]) -> CorsLayer {
+    use axum::http::{header, HeaderValue, Method};
+    let values: Vec<HeaderValue> = origins.iter().filter_map(|origin| origin.parse().ok()).collect();
     CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
+        .allow_origin(tower_http::cors::AllowOrigin::list(values))
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
 }
