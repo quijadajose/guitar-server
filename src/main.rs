@@ -24,7 +24,7 @@ async fn main() {
     let service_key = std::env::var("SUPABASE_SECRET_KEY").expect("SUPABASE_SECRET_KEY");
     let resend_key = std::env::var("RESEND_KEY").expect("RESEND_KEY");
     let resend_from = std::env::var("RESEND_FROM").unwrap_or_else(|_| "onboarding@resend.dev".into());
-    let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "https://quijadajose.github.io".into());
+    let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "https://quijadajose.github.io/guitar-app/".into());
     let mut allowed_origins = vec![
         app_url.clone(),
         "https://quijadajose.github.io".into(),
