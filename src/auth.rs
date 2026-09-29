@@ -123,10 +123,11 @@ async fn send_link(
     if !valid_email(&email) {
         return err(StatusCode::BAD_REQUEST, "Email inválido.");
     }
-    let redirect = match resolve_redirect(body.redirect_to.as_deref(), &auth.config) {
-        Ok(redirect) => redirect,
-        Err(()) => return err(StatusCode::BAD_REQUEST, "El retorno del enlace no está permitido."),
-    };
+    let redirect = body.redirect_to
+        .as_deref()
+        .and_then(|r| resolve_redirect(Some(r), &auth.config).ok())
+        .unwrap_or_else(|| auth.config.app_url.clone());
+
     let issued = match generate_link(&auth, link_type, &email, &redirect).await {
         Ok(issued) => issued,
         Err(()) => return ok(),
