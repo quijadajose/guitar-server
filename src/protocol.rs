@@ -22,6 +22,14 @@ pub enum ClientMessage {
     SetReady {
         ready: bool,
     },
+    UpdateRoom {
+        song_id: String,
+        mode: GameMode,
+        is_public: bool,
+    },
+    Chat {
+        text: String,
+    },
     StartGame,
     PlayerProgress {
         score: u32,
@@ -67,6 +75,7 @@ pub enum ServerMessage {
         role: PlayerRole,
         song_id: String,
         mode: GameMode,
+        is_public: bool,
     },
     RoomJoined {
         room_code: String,
@@ -74,12 +83,22 @@ pub enum ServerMessage {
         role: PlayerRole,
         song_id: String,
         mode: GameMode,
+        is_public: bool,
         players: Vec<PlayerSummary>,
         spectators_count: usize,
     },
     RoomUpdated {
         players: Vec<PlayerSummary>,
         spectators_count: usize,
+    },
+    RoomSettings {
+        song_id: String,
+        mode: GameMode,
+        is_public: bool,
+    },
+    Chat {
+        name: String,
+        text: String,
     },
     GameStarting {
         start_at_epoch_ms: u64,

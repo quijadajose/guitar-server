@@ -276,6 +276,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         role: crate::models::PlayerRole::Host,
                         song_id,
                         mode,
+                        is_public,
                     },
                 )
                 .await;
@@ -301,12 +302,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 room.code.clone(),
                                 room.song_id.clone(),
                                 room.mode.clone(),
+                                room.is_public(),
                                 room.players_summary(),
                                 room.spectators.len(),
                             )
                         })
                 };
-                let Some((role, code, song_id, mode, players, spectators_count)) = joined else {
+                let Some((role, code, song_id, mode, is_public, players, spectators_count)) = joined else {
                     emit_error(&out_tx, "Sala llena").await;
                     continue;
                 };
@@ -332,6 +334,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         role,
                         song_id,
                         mode,
+                        is_public,
                         players,
                         spectators_count,
                     },
@@ -362,6 +365,74 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     players: room.players_summary(),
                     spectators_count: room.spectators.len(),
                 });
+            }
+
+            ClientMessage::UpdateRoom {
+                song_id,
+                mode,
+                is_public,
+            } => {
+                let Some(ref code) = current_room_code else {
+                    continue;
+                };
+                let song_id = clip(song_id.trim(), MAX_SONG_ID_CHARS).to_string();
+                if song_budget(&song_id).is_none() {
+                    emit_error(&out_tx, "canción no disponible para versus").await;
+                    continue;
+                }
+                let Some(room_handle) = state.get_room(code) else {
+                    continue;
+                };
+                let mut room = room_handle.write().await;
+                let is_host = room
+                    .host
+                    .as_ref()
+                    .is_some_and(|host| host.session_id == session_id);
+                if !is_host || room.is_playing {
+                    emit_error(&out_tx, "solo el anfitrión puede cambiar la sala").await;
+                    continue;
+                }
+                room.song_id = song_id.clone();
+                room.mode = mode.clone();
+                room.is_public = is_public;
+                if let Some(ref mut host) = room.host {
+                    host.ready = false;
+                }
+                if let Some(ref mut guest) = room.guest {
+                    guest.ready = false;
+                }
+                room.touch();
+                let _ = room.tx.send(ServerMessage::RoomSettings {
+                    song_id,
+                    mode,
+                    is_public,
+                });
+                let _ = room.tx.send(ServerMessage::RoomUpdated {
+                    players: room.players_summary(),
+                    spectators_count: room.spectators.len(),
+                });
+            }
+
+            ClientMessage::Chat { text } => {
+                let text = clip(text.trim(), 180).to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                let Some(ref code) = current_room_code else {
+                    continue;
+                };
+                let Some(room_handle) = state.get_room(code) else {
+                    continue;
+                };
+                let room = room_handle.read().await;
+                let name = room
+                    .host
+                    .as_ref()
+                    .filter(|player| player.session_id == session_id)
+                    .or(room.guest.as_ref().filter(|player| player.session_id == session_id))
+                    .map(|player| player.name.clone())
+                    .unwrap_or_else(|| "Jugador".to_string());
+                let _ = room.tx.send(ServerMessage::Chat { name, text });
             }
 
             ClientMessage::StartGame => {
