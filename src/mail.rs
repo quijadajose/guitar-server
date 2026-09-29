@@ -32,7 +32,9 @@ impl Mailer {
         if response.status().is_success() {
             Ok(())
         } else {
-            tracing::warn!("resend: {}", response.status());
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!("resend error {status}: {body}");
             Err(())
         }
     }
