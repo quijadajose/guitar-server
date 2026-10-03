@@ -7,12 +7,8 @@ pub struct Mailer {
 }
 
 impl Mailer {
-    pub fn new(api_key: String, from: String) -> Self {
-        Self {
-            api_key,
-            from,
-            http: reqwest::Client::new(),
-        }
+    pub fn new(api_key: String, from: String, http: reqwest::Client) -> Self {
+        Self { api_key, from, http }
     }
 
     pub async fn send_html(&self, to: &str, subject: &str, html: &str) -> Result<(), ()> {
@@ -32,9 +28,8 @@ impl Mailer {
         if response.status().is_success() {
             Ok(())
         } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            tracing::warn!("resend error {status}: {body}");
+            // No volcar el cuerpo completo: puede traer el email del destinatario.
+            tracing::warn!("resend error {}", response.status());
             Err(())
         }
     }

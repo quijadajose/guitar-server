@@ -54,9 +54,15 @@ impl Player {
         }
     }
 
+    /// Estado limpio para una partida nueva (incluida la revancha).
     pub fn reset_match(&mut self) {
         self.attack_charge = 0;
         self.seen_notes.clear();
+        self.checksum = None;
+        self.is_disqualified = false;
+        self.score = 0;
+        self.combo = 0;
+        self.accuracy = 100.0;
     }
 
     /// Solo cuenta un id de nota que existe en la canción, una sola vez.

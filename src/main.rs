@@ -32,6 +32,15 @@ async fn main() {
     if let Ok(extra) = std::env::var("CORS_ORIGINS") {
         allowed_origins.extend(extra.split(',').map(|item| item.trim().to_string()).filter(|item| !item.is_empty()));
     }
+    // Solo confiar en X-Forwarded-For si el servidor corre detrás de un proxy propio.
+    let trust_proxy = std::env::var("TRUST_PROXY").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+    // Sin timeout, una llamada colgada a Supabase/Resend retiene la tarea para siempre.
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("reqwest client");
 
     let auth = AuthState {
         config: AuthConfig {
@@ -39,10 +48,12 @@ async fn main() {
             service_key,
             app_url,
             allowed_origins: allowed_origins.clone(),
-            http: reqwest::Client::new(),
+            http: http.clone(),
+            trust_proxy,
         },
-        mailer: Arc::new(Mailer::new(resend_key, resend_from)),
+        mailer: Arc::new(Mailer::new(resend_key, resend_from, http)),
         limiter: RateLimiter::default(),
+        email_limiter: RateLimiter::default(),
     };
 
     let state = AppState::new(auth);
@@ -54,6 +65,9 @@ async fn main() {
         loop {
             interval.tick().await;
             state_cleanup.clean_inactive_rooms().await;
+            // Los limitadores guardan una entrada por IP/email: sin purga crecen sin límite.
+            state_cleanup.auth.limiter.purge();
+            state_cleanup.auth.email_limiter.purge();
         }
     });
 
@@ -103,7 +117,11 @@ pub fn router(state: AppState) -> Router {
 
 fn cors_layer(origins: &[String]) -> CorsLayer {
     use axum::http::{header, HeaderValue, Method};
-    let values: Vec<HeaderValue> = origins.iter().filter_map(|origin| origin.parse().ok()).collect();
+    let values: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|origin| auth::origin_of(origin))
+        .filter_map(|origin| origin.parse().ok())
+        .collect();
     CorsLayer::new()
         .allow_origin(tower_http::cors::AllowOrigin::list(values))
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])

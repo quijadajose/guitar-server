@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -24,14 +24,21 @@ pub struct AuthConfig {
     pub app_url: String,
     pub allowed_origins: Vec<String>,
     pub http: reqwest::Client,
+    pub trust_proxy: bool,
 }
 
 #[derive(Clone)]
 pub struct AuthState {
     pub config: AuthConfig,
     pub mailer: Arc<Mailer>,
+    /// Límite por IP para todas las rutas /auth.
     pub limiter: RateLimiter,
+    /// Límite por destinatario: evita usar el servidor para inundar el buzón de un tercero.
+    pub email_limiter: RateLimiter,
 }
+
+const LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const MAX_KEYS: usize = 10_000;
 
 #[derive(Clone, Default)]
 pub struct RateLimiter {
@@ -40,17 +47,48 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn allow(&self, key: &str) -> bool {
-        const WINDOW: Duration = Duration::from_secs(60);
-        const MAX: usize = 8;
+        self.allow_n(key, 8, LIMIT_WINDOW)
+    }
+
+    pub fn allow_n(&self, key: &str, max: usize, window: Duration) -> bool {
+        // Tope duro de memoria: si alguien rota miles de IPs, se rechaza en vez de crecer.
+        if self.hits.len() >= MAX_KEYS && !self.hits.contains_key(key) {
+            return false;
+        }
         let now = Instant::now();
         let mut hits = self.hits.entry(key.to_string()).or_default();
-        hits.retain(|at| now.duration_since(*at) < WINDOW);
-        if hits.len() >= MAX {
+        hits.retain(|at| now.duration_since(*at) < window);
+        if hits.len() >= max {
             return false;
         }
         hits.push(now);
         true
     }
+
+    /// Borra las claves sin actividad reciente.
+    pub fn purge(&self) {
+        let now = Instant::now();
+        self.hits.retain(|_, hits| {
+            hits.retain(|at| now.duration_since(*at) < Duration::from_secs(3600));
+            !hits.is_empty()
+        });
+    }
+}
+
+/// IP real del cliente. Solo usa X-Forwarded-For si TRUST_PROXY está activo,
+/// porque de lo contrario cualquiera podría falsificarla y saltarse el límite.
+pub fn client_ip(config: &AuthConfig, headers: &HeaderMap, peer: &SocketAddr) -> String {
+    if config.trust_proxy {
+        if let Some(ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        {
+            return ip.to_string();
+        }
+    }
+    peer.ip().to_string()
 }
 
 pub async fn limit_auth(
@@ -59,7 +97,8 @@ pub async fn limit_auth(
     request: Request,
     next: Next,
 ) -> Response {
-    if !auth.limiter.allow(&addr.ip().to_string()) {
+    let ip = client_ip(&auth.config, request.headers(), &addr);
+    if !auth.limiter.allow(&ip) {
         return err(StatusCode::TOO_MANY_REQUESTS, "Demasiados intentos. Probá de nuevo en un minuto.");
     }
     next.run(request).await
@@ -69,11 +108,6 @@ pub async fn limit_auth(
 pub struct EmailBody {
     pub email: String,
     pub redirect_to: Option<String>,
-}
-
-struct IssuedLink {
-    action_link: String,
-    user_id: Option<String>,
 }
 
 pub async fn magic_link(State(auth): State<AuthState>, Json(body): Json<EmailBody>) -> impl IntoResponse {
@@ -98,6 +132,8 @@ pub async fn schedule_deletion(State(auth): State<AuthState>, headers: HeaderMap
     if set_deletion_due(&auth, &user_id, Some(&due)).await.is_err() {
         return err(StatusCode::BAD_GATEWAY, "No se pudo programar la eliminación.");
     }
+    // Cerrar todas las sesiones abiertas (otros aparatos) del usuario.
+    revoke_sessions(&auth, &headers).await;
     ok()
 }
 
@@ -123,16 +159,21 @@ async fn send_link(
     if !valid_email(&email) {
         return err(StatusCode::BAD_REQUEST, "Email inválido.");
     }
+    // Máximo 3 enlaces por destinatario cada 15 minutos.
+    if !auth.email_limiter.allow_n(&email, 3, Duration::from_secs(15 * 60)) {
+        return err(StatusCode::TOO_MANY_REQUESTS, "Ya enviamos varios enlaces a ese email. Esperá unos minutos.");
+    }
     let redirect = body.redirect_to
         .as_deref()
         .and_then(|r| resolve_redirect(Some(r), &auth.config).ok())
         .unwrap_or_else(|| auth.config.app_url.clone());
 
-    let issued = match generate_link(&auth, link_type, &email, &redirect).await {
-        Ok(issued) => issued,
+    let action_link = match generate_link(&auth, link_type, &email, &redirect).await {
+        Ok(link) => link,
+        // Responder ok igual: no revelar si el email existe.
         Err(()) => return ok(),
     };
-    let html = mail_html(intro, &issued.action_link, cta);
+    let html = mail_html(intro, &action_link, cta);
     if auth.mailer.send_html(&email, subject, &html).await.is_err() {
         return err(StatusCode::BAD_GATEWAY, "No se pudo enviar el email.");
     }
@@ -144,7 +185,7 @@ async fn generate_link(
     link_type: &str,
     email: &str,
     redirect: &str,
-) -> Result<IssuedLink, ()> {
+) -> Result<String, ()> {
     let payload = json!({
         "type": link_type,
         "email": email,
@@ -168,24 +209,30 @@ async fn generate_link(
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| tracing::warn!("generate_link sin action_link"))?;
-    let user_id = body
-        .get("id")
-        .and_then(Value::as_str)
-        .or_else(|| body.pointer("/user/id").and_then(Value::as_str))
-        .filter(|id| Uuid::parse_str(id).is_ok())
-        .map(str::to_string);
-    Ok(IssuedLink { action_link, user_id })
+    // El enlace va dentro de un email: solo aceptamos https/http del propio Supabase.
+    let expected = origin_of(base_url(auth));
+    if expected.is_none() || origin_of(&action_link) != expected {
+        tracing::warn!("generate_link devolvió un enlace con otro origen");
+        return Err(());
+    }
+    Ok(action_link)
 }
 
-async fn caller_id(auth: &AuthState, headers: &HeaderMap) -> Option<String> {
+fn bearer(headers: &HeaderMap) -> Option<&str> {
     let token = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
         .ok()?
-        .strip_prefix("Bearer ")?;
-    if token.is_empty() {
+        .strip_prefix("Bearer ")?
+        .trim();
+    if token.is_empty() || token.len() > 4096 {
         return None;
     }
+    Some(token)
+}
+
+async fn caller_id(auth: &AuthState, headers: &HeaderMap) -> Option<String> {
+    let token = bearer(headers)?;
     let url = format!("{}/auth/v1/user", base_url(auth));
     let response = auth
         .config
@@ -203,6 +250,22 @@ async fn caller_id(auth: &AuthState, headers: &HeaderMap) -> Option<String> {
     let id = body.get("id").and_then(Value::as_str)?;
     Uuid::parse_str(id).ok()?;
     Some(id.to_string())
+}
+
+async fn revoke_sessions(auth: &AuthState, headers: &HeaderMap) {
+    let Some(token) = bearer(headers) else { return };
+    let url = format!("{}/auth/v1/logout?scope=global", base_url(auth));
+    let result = auth
+        .config
+        .http
+        .post(url)
+        .header("apikey", &auth.config.service_key)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await;
+    if let Err(err) = result {
+        tracing::warn!("logout global: {err}");
+    }
 }
 
 async fn set_deletion_due(auth: &AuthState, id: &str, due: Option<&str>) -> Result<(), ()> {
@@ -291,7 +354,7 @@ pub async fn purge_scheduled_deletions(auth: &AuthState) {
                 due_ids.push(id.to_string());
             }
         }
-        if users.len() < 200 {
+        if users.len() < 200 || page >= 500 {
             break;
         }
         page += 1;
@@ -368,6 +431,7 @@ fn escape_html(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 pub fn resolve_redirect(requested: Option<&str>, config: &AuthConfig) -> Result<String, ()> {
@@ -381,27 +445,53 @@ pub fn resolve_redirect(requested: Option<&str>, config: &AuthConfig) -> Result<
     }
 }
 
-fn origin_of(url: &str) -> Option<String> {
+/// `scheme://host[:port]` en minúsculas, o None si la URL no es http(s) válida.
+pub fn origin_of(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
     if scheme != "http" && scheme != "https" {
         return None;
     }
-    let authority = rest.split(['/', '?', '#']).next()?;
-    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace) {
+    // Una barra invertida se interpreta distinto según el parser (navegador vs. cliente
+    // de correo): se rechaza para que nadie pueda esconder otro host detrás.
+    if rest.contains('\\') {
         return None;
     }
-    Some(format!("{scheme}://{authority}"))
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(format!("{scheme}://{}", authority.to_ascii_lowercase()))
+}
+
+/// Comprueba la cabecera Origin contra la lista permitida.
+pub fn origin_allowed(config: &AuthConfig, origin: &str) -> bool {
+    let Some(origin) = origin_of(origin) else {
+        return false;
+    };
+    std::iter::once(config.app_url.as_str())
+        .chain(config.allowed_origins.iter().map(String::as_str))
+        .filter_map(origin_of)
+        .any(|item| item == origin)
 }
 
 fn valid_email(email: &str) -> bool {
+    if email.len() > 254 {
+        return false;
+    }
     let Some((local, domain)) = email.split_once('@') else {
         return false;
     };
     !local.is_empty()
+        && local.len() <= 64
+        && !domain.contains('@')
         && domain.contains('.')
         && !domain.starts_with('.')
         && !domain.ends_with('.')
-        && !email.chars().any(|c| c.is_whitespace() || c == '<' || c == '>')
+        && !email.chars().any(|c| c.is_whitespace() || c.is_control() || c == '<' || c == '>' || c == ',' || c == ';')
 }
 
 fn ok() -> Response {
@@ -423,6 +513,7 @@ mod tests {
             app_url: app_url.into(),
             allowed_origins: extra.iter().map(|item| (*item).to_string()).collect(),
             http: reqwest::Client::new(),
+            trust_proxy: false,
         }
     }
 
@@ -435,6 +526,7 @@ mod tests {
         );
         assert!(resolve_redirect(Some("https://evil.example/phish"), &config).is_err());
         assert!(resolve_redirect(Some("javascript:alert(1)"), &config).is_err());
+        assert!(resolve_redirect(Some("http://localhost:5173\\@evil.example"), &config).is_err());
         assert_eq!(
             resolve_redirect(None, &config).unwrap(),
             "http://localhost:5173"
@@ -442,11 +534,44 @@ mod tests {
     }
 
     #[test]
+    fn origin_check_ignores_path_and_case() {
+        let config = config("https://quijadajose.github.io/guitar-app/", &[]);
+        assert!(origin_allowed(&config, "https://quijadajose.github.io"));
+        assert!(origin_allowed(&config, "https://QuijadaJose.github.io"));
+        assert!(!origin_allowed(&config, "https://evil.github.io"));
+        assert!(!origin_allowed(&config, "null"));
+    }
+
+    #[test]
     fn email_rejects_header_noise() {
         assert!(valid_email("a@b.co"));
         assert!(!valid_email("a@b"));
         assert!(!valid_email("a@b.co\nBcc: x@y.z"));
+        assert!(!valid_email("a@b.co,c@d.co"));
+        assert!(!valid_email("a@b@c.co"));
         assert!(!valid_email("not-an-email"));
+    }
+
+    #[test]
+    fn limiter_blocks_after_max_and_purges() {
+        let limiter = RateLimiter::default();
+        for _ in 0..3 {
+            assert!(limiter.allow_n("x", 3, Duration::from_secs(60)));
+        }
+        assert!(!limiter.allow_n("x", 3, Duration::from_secs(60)));
+        limiter.purge();
+        assert_eq!(limiter.hits.len(), 1);
+    }
+
+    #[test]
+    fn forwarded_ip_only_when_trusted() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4, 10.0.0.1".parse().unwrap());
+        let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let mut cfg = config("http://localhost:5173", &[]);
+        assert_eq!(client_ip(&cfg, &headers, &peer), "10.0.0.1");
+        cfg.trust_proxy = true;
+        assert_eq!(client_ip(&cfg, &headers, &peer), "1.2.3.4");
     }
 
     #[test]
