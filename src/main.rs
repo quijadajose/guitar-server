@@ -140,7 +140,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/magic-link", post(auth::magic_link))
         .route(
             "/auth/account/deletion",
-            post(auth::schedule_deletion).delete(auth::cancel_deletion),
+            get(auth::deletion_status).post(auth::schedule_deletion).delete(auth::cancel_deletion),
         )
         .layer(middleware::from_fn_with_state(state.auth.clone(), auth::limit_auth));
 

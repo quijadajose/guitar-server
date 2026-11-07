@@ -600,7 +600,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: SocketPermit
                     score: score.min(max_score),
                     combo: combo.min(budget.events),
                     accuracy,
-                    measure: measure.min(64),
+                    measure: measure.min(96), // = SONG_LIMITS.measuresMax en guitar-app
                 });
             }
 

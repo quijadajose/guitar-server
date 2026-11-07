@@ -71,7 +71,7 @@ alter table public.community_songs add constraint community_songs_bpm_range
 
 alter table public.community_songs drop constraint if exists community_songs_measures_range;
 alter table public.community_songs add constraint community_songs_measures_range
-  check (measures between 1 and 32) not valid;
+  check (measures between 1 and 96) not valid;
 
 alter table public.community_songs drop constraint if exists community_songs_mode_enum;
 alter table public.community_songs add constraint community_songs_mode_enum
