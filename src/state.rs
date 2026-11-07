@@ -1,9 +1,10 @@
-use crate::auth::AuthState;
+use crate::auth::{AuthState, RateLimiter};
+use crate::protocol::ServerMessage as Msg;
 use axum::extract::FromRef;
 use crate::models::{GameMode, Player, PlayerRole, PublicRoom, Room};
 use crate::protocol::ServerMessage;
 use dashmap::DashMap;
-use rand::{distributions::Alphanumeric, Rng};
+use rand::Rng;
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -28,6 +29,8 @@ pub type RoomMap = Arc<DashMap<String, RoomHandle>>;
 pub struct AppState {
     pub rooms: RoomMap,
     pub auth: AuthState,
+    /// Límite por IP para GET /rooms (la lista pública se pide en bucle desde el menú).
+    pub rooms_limiter: RateLimiter,
     sockets: Arc<AtomicUsize>,
     sockets_per_ip: Arc<DashMap<String, usize>>,
 }
@@ -43,6 +46,7 @@ impl AppState {
         Self {
             rooms: Arc::new(DashMap::new()),
             auth,
+            rooms_limiter: RateLimiter::default(),
             sockets: Arc::new(AtomicUsize::new(0)),
             sockets_per_ip: Arc::new(DashMap::new()),
         }
@@ -84,7 +88,7 @@ impl AppState {
 
     /// Copia los handles para no retener el lock de un shard de DashMap
     /// mientras se espera un RwLock de tokio (eso puede bloquear un worker).
-    fn room_handles(&self) -> Vec<(String, RoomHandle)> {
+    pub(crate) fn room_handles(&self) -> Vec<(String, RoomHandle)> {
         self.rooms
             .iter()
             .map(|item| (item.key().clone(), item.value().clone()))
@@ -107,12 +111,7 @@ impl AppState {
 
         // Insertar con entry() evita la carrera entre "comprobar si existe" e "insertar".
         for _ in 0..32 {
-            let code: String = rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(5)
-                .map(char::from)
-                .collect::<String>()
-                .to_uppercase();
+            let code = new_room_code();
             if let dashmap::mapref::entry::Entry::Vacant(slot) = self.rooms.entry(code.clone()) {
                 room.code = code.clone();
                 let room_handle = Arc::new(RwLock::new(room));
@@ -121,6 +120,14 @@ impl AppState {
             }
         }
         None
+    }
+
+    /// Avisa a todas las salas antes de apagar el servidor, para que el cliente no tome un corte por error.
+    pub async fn announce_restart(&self) {
+        for (_, handle) in self.room_handles() {
+            let room = handle.read().await;
+            let _ = room.tx.send(Msg::RoomClosed { reason: "restart".into() });
+        }
     }
 
     pub async fn list_public_rooms(&self) -> Vec<PublicRoom> {
@@ -185,6 +192,17 @@ impl AppState {
     }
 }
 
+/// Código de 5 caracteres sin ambiguos (sin 0/O, 1/I/L): se puede dictar en voz alta.
+const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+const CODE_LEN: usize = 5;
+
+fn new_room_code() -> String {
+    let mut rng = rand::thread_rng();
+    (0..CODE_LEN)
+        .map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char)
+        .collect()
+}
+
 pub fn now_epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -206,6 +224,7 @@ pub(crate) mod tests {
             config: AuthConfig {
                 supabase_url: "https://example.supabase.co".into(),
                 service_key: "test".into(),
+                publishable_key: "test".into(),
                 app_url: "http://localhost:5173".into(),
                 allowed_origins: vec!["http://localhost:5173".into()],
                 http: http.clone(),
@@ -260,6 +279,16 @@ pub(crate) mod tests {
         let lower = code.to_lowercase();
         assert!(state.get_room(&lower).is_some());
         assert!(state.get_room("XXXXXXXXXXXXXXXX").is_none());
+    }
+
+    #[test]
+    fn room_codes_use_unambiguous_alphabet() {
+        for _ in 0..200 {
+            let code = super::new_room_code();
+            assert_eq!(code.len(), super::CODE_LEN);
+            assert!(code.bytes().all(|b| super::CODE_ALPHABET.contains(&b)));
+            assert!(!code.contains(['0', 'O', '1', 'I', 'L']));
+        }
     }
 
     #[tokio::test]

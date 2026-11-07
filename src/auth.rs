@@ -21,6 +21,8 @@ use uuid::Uuid;
 pub struct AuthConfig {
     pub supabase_url: String,
     pub service_key: String,
+    /// Clave publicable (anon): alcanza para validar el token del usuario. Menos privilegio que la secreta.
+    pub publishable_key: String,
     pub app_url: String,
     pub allowed_origins: Vec<String>,
     pub http: reqwest::Client,
@@ -78,15 +80,15 @@ impl RateLimiter {
 /// IP real del cliente. Solo usa X-Forwarded-For si TRUST_PROXY está activo,
 /// porque de lo contrario cualquiera podría falsificarla y saltarse el límite.
 pub fn client_ip(config: &AuthConfig, headers: &HeaderMap, peer: &SocketAddr) -> String {
-    if config.trust_proxy {
-        if let Some(ip) = headers
+    let forwarded = config.trust_proxy.then(|| {
+        headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.split(',').next())
             .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        {
-            return ip.to_string();
-        }
+    }).flatten();
+    if let Some(ip) = forwarded {
+        return ip.to_string();
     }
     peer.ip().to_string()
 }
@@ -174,8 +176,9 @@ async fn send_link(
         Err(()) => return ok(),
     };
     let html = mail_html(intro, &action_link, cta);
+    // Igual que si el email no existiera: un error aquí revelaría qué cuentas existen.
     if auth.mailer.send_html(&email, subject, &html).await.is_err() {
-        return err(StatusCode::BAD_GATEWAY, "No se pudo enviar el email.");
+        tracing::warn!("no se pudo enviar el enlace de acceso");
     }
     ok()
 }
@@ -238,7 +241,7 @@ async fn caller_id(auth: &AuthState, headers: &HeaderMap) -> Option<String> {
         .config
         .http
         .get(url)
-        .header("apikey", &auth.config.service_key)
+        .header("apikey", &auth.config.publishable_key)
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
@@ -512,6 +515,7 @@ mod tests {
             service_key: "test".into(),
             app_url: app_url.into(),
             allowed_origins: extra.iter().map(|item| (*item).to_string()).collect(),
+            publishable_key: "test".into(),
             http: reqwest::Client::new(),
             trust_proxy: false,
         }

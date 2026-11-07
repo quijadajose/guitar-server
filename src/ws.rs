@@ -1,5 +1,6 @@
 use crate::{
     auth,
+    catalog::{self, SongSpec},
     protocol::{ClientMessage, ServerMessage},
     state::{now_epoch_ms, AppState, RoomHandle},
 };
@@ -20,7 +21,7 @@ use tokio::{
 use tracing::warn;
 
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
-const MAX_NAME_CHARS: usize = 24;
+const MAX_NAME_CHARS: usize = 16;
 const MAX_SONG_ID_CHARS: usize = 64;
 const MAX_REASON_CHARS: usize = 48;
 const MAX_CHECKSUM_CHARS: usize = 128;
@@ -79,18 +80,12 @@ impl RateGate {
     }
 }
 
-struct SongBudget {
-    events: u32,
-    points_per_hit: u32,
+fn song_budget(song_id: &str) -> Option<&'static SongSpec> {
+    catalog::find(song_id)
 }
 
-fn song_budget(song_id: &str) -> Option<SongBudget> {
-    match song_id {
-        "sultans_swing" => Some(SongBudget { events: 8, points_per_hit: 150 }),
-        "fur_elise" => Some(SongBudget { events: 130, points_per_hit: 150 }),
-        "chords_progression" => Some(SongBudget { events: 5, points_per_hit: 300 }),
-        _ => None,
-    }
+fn is_progress(msg: &ServerMessage) -> bool {
+    matches!(msg, ServerMessage::OpponentProgress { .. })
 }
 
 fn fnv1a_hex(raw: &str) -> String {
@@ -154,10 +149,15 @@ impl Drop for SocketPermit {
     }
 }
 
+/// Reenvía los eventos de la sala a este socket. Si el cliente no puede seguir el ritmo
+/// y se pierde un evento de estado (sala, inicio, cierre), no se descarta en silencio:
+/// se avisa por `kill_tx` para cerrar la conexión y que el cliente reconecte y se resincronice.
+/// Solo el progreso se puede perder, porque el siguiente llega en 100 ms.
 fn spawn_forwarder(
     tx: &broadcast::Sender<ServerMessage>,
     session_id: String,
     out_tx: mpsc::Sender<Message>,
+    kill_tx: mpsc::Sender<()>,
 ) -> JoinHandle<()> {
     let mut rx = tx.subscribe();
     tokio::spawn(async move {
@@ -172,12 +172,19 @@ fn spawn_forwarder(
                     };
                     match out_tx.try_send(Message::Text(json)) {
                         Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) if is_progress(&msg) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!("Cliente {session_id} no sigue el ritmo: se cierra la conexión");
+                            let _ = kill_tx.try_send(());
+                            break;
+                        }
                         Err(mpsc::error::TrySendError::Closed(_)) => break,
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!("Broadcast lagged by {skipped} messages for {session_id}");
+                    warn!("Broadcast lagged by {skipped} messages for {session_id}; se cierra la conexión");
+                    let _ = kill_tx.try_send(());
+                    break;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -271,11 +278,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: SocketPermit
     let mut current_room_code: Option<String> = None;
     let mut forward: Option<JoinHandle<()>> = None;
     let mut rates = RateGate::new();
+    // Este extremo se mantiene vivo mientras dura el socket; los forwarders reciben clones.
+    let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
 
     loop {
-        let next = match tokio::time::timeout(IDLE_TIMEOUT, receiver.next()).await {
-            Ok(next) => next,
-            Err(_) => break, // conexión muda: liberar el cupo
+        let next = tokio::select! {
+            res = tokio::time::timeout(IDLE_TIMEOUT, receiver.next()) => match res {
+                Ok(next) => next,
+                Err(_) => break, // conexión muda: liberar el cupo
+            },
+            _ = kill_rx.recv() => break, // el forwarder pidió cerrar (cliente lento)
         };
         let Some(msg_res) = next else { break };
         let msg = match msg_res {
@@ -322,14 +334,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: SocketPermit
                 }
                 let player_name = plain_name(&player_name);
 
-                // Salir de la sala anterior: si no, un socket podía acaparar todas las salas.
-                if let Some(task) = forward.take() {
-                    task.abort();
-                }
-                if let Some(code) = current_room_code.take() {
-                    leave_room(&state, &code, &session_id).await;
-                }
-
+                // Primero crear la sala nueva: si no hay sitio, se conserva la actual.
                 let Some((code, room_handle)) = state
                     .create_room(
                         song_id.clone(),
@@ -344,9 +349,17 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: SocketPermit
                     continue;
                 };
 
+                // Después salir de la anterior (un socket no puede acaparar salas).
+                if let Some(task) = forward.take() {
+                    task.abort();
+                }
+                if let Some(old) = current_room_code.take() {
+                    leave_room(&state, &old, &session_id).await;
+                }
+
                 {
                     let room = room_handle.read().await;
-                    forward = Some(spawn_forwarder(&room.tx, session_id.clone(), out_tx.clone()));
+                    forward = Some(spawn_forwarder(&room.tx, session_id.clone(), out_tx.clone(), kill_tx.clone()));
                 }
                 current_room_code = Some(code.clone());
 
@@ -384,13 +397,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: SocketPermit
                     continue;
                 }
 
-                if let Some(task) = forward.take() {
-                    task.abort();
-                }
-                if let Some(code) = current_room_code.take() {
-                    leave_room(&state, &code, &session_id).await;
-                }
-
+                // Primero entrar a la sala nueva: si está llena, la sala actual no se toca.
                 let joined = {
                     let mut room = room_handle.write().await;
                     room.add_player(session_id.clone(), player_name, as_spectator)
@@ -411,9 +418,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: SocketPermit
                     continue;
                 };
 
+                if let Some(task) = forward.take() {
+                    task.abort();
+                }
+                if let Some(old) = current_room_code.take() {
+                    leave_room(&state, &old, &session_id).await;
+                }
+
                 {
                     let room = room_handle.read().await;
-                    forward = Some(spawn_forwarder(&room.tx, session_id.clone(), out_tx.clone()));
+                    forward = Some(spawn_forwarder(&room.tx, session_id.clone(), out_tx.clone(), kill_tx.clone()));
                     let _ = room.tx.send(ServerMessage::RoomUpdated {
                         players: players.clone(),
                         spectators_count,
@@ -535,13 +549,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: SocketPermit
                     continue;
                 };
                 let mut room = room_handle.write().await;
+                room.expire_stale_match();
                 let is_host = room
                     .host
                     .as_ref()
                     .is_some_and(|h| h.session_id == session_id);
                 let both_ready = room.host.as_ref().is_some_and(|h| h.ready)
                     && room.guest.as_ref().is_some_and(|g| g.ready);
-                room.expire_stale_match();
                 if is_host && both_ready && !room.is_playing {
                     room.start_match();
                     if let Some(ref mut h) = room.host {
@@ -685,6 +699,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: SocketPermit
                 if room.player(&session_id).is_none() {
                     continue;
                 }
+                if room.is_playing {
+                    // Avisar: si no, el cliente queda esperando una revancha que nunca llega.
+                    emit_error(&out_tx, "La partida sigue en curso").await;
+                    continue;
+                }
                 room.touch();
                 let _ = room.tx.send(ServerMessage::RematchRequested {
                     by_session_id: session_id.clone(),
@@ -727,14 +746,21 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: SocketPermit
                 let is_cheated = match budget {
                     Some(budget) => {
                         let max_score = budget.events.saturating_mul(budget.points_per_hit).saturating_mul(4);
+                        let hits_seen = player.seen_notes.len();
+                        let max_from_hits = hits
+                            .saturating_mul(budget.points_per_hit)
+                            .saturating_mul(4);
                         !checksum_ok
                             || !accuracy.is_finite()
                             || !(0.0..=100.0).contains(&accuracy)
                             || total_notes != budget.events
                             || hits > budget.events
+                            // No se puede reportar más aciertos que notas que llegaron por note_hit.
+                            || hits as usize > hits_seen
                             || max_combo > budget.events
                             || max_combo > hits
                             || final_score > max_score
+                            || final_score > max_from_hits
                     }
                     None => true,
                 };
@@ -789,8 +815,9 @@ mod tests {
     #[test]
     fn checksum_matches_client_formula() {
         // Misma fórmula que versusLobby.ts (FNV-1a de 32 bits).
+        // Vector compartido con guitar-app/src/__tests__/versusCatalog.test.ts.
         let raw = "fur_elise:1000:10:95.5:20:130";
-        assert_eq!(super::fnv1a_hex(raw).len(), 8);
+        assert_eq!(super::fnv1a_hex(raw), "03784fe2");
     }
 
     #[tokio::test]
@@ -838,6 +865,40 @@ mod tests {
             .expect("sala");
         super::leave_room(&state, &code, "h").await;
         assert!(state.get_room(&code).is_none());
+    }
+
+    #[tokio::test]
+    async fn slow_client_gets_disconnected_instead_of_losing_state() {
+        // Un cliente que no lee: el canal de salida se llena y un evento de estado debe cerrar la conexión.
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+        let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel(1);
+        let _task = super::spawn_forwarder(&tx, "lento".into(), out_tx, kill_tx);
+        // Primer mensaje llena el canal (no se lee _out_rx), el segundo no cabe.
+        for _ in 0..2 {
+            let _ = tx.send(crate::protocol::ServerMessage::Chat { name: "a".into(), text: "b".into() });
+        }
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), kill_rx.recv()).await;
+        assert!(matches!(got, Ok(Some(()))));
+    }
+
+    #[tokio::test]
+    async fn progress_may_be_dropped_without_disconnect() {
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+        let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel(1);
+        let _task = super::spawn_forwarder(&tx, "lento".into(), out_tx, kill_tx);
+        for _ in 0..5 {
+            let _ = tx.send(crate::protocol::ServerMessage::OpponentProgress {
+                session_id: "otro".into(),
+                score: 1,
+                combo: 0,
+                accuracy: 100.0,
+                measure: 1,
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(kill_rx.try_recv().is_err());
     }
 
     #[test]
