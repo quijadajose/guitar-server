@@ -109,7 +109,7 @@ select s.*
    and (s.section is null or char_length(s.section) <= 80)
    and char_length(s.creator_name) between 1 and 30
    and s.bpm between 50 and 180
-   and s.measures between 1 and 32
+   and s.measures between 1 and 96
    and s.mode in ('notes', 'chords')
    and s.difficulty in ('easy', 'medium', 'hard', 'expert')
    and jsonb_typeof(s.notes) = 'array'
