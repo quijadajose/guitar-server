@@ -271,99 +271,107 @@ async fn revoke_sessions(auth: &AuthState, headers: &HeaderMap) {
     }
 }
 
+/// Programa (`Some`) o cancela (`None`) la eliminación en la tabla
+/// `account_deletion_requests`. El purgado lee solo esa tabla: ya no recorre usuarios.
 async fn set_deletion_due(auth: &AuthState, id: &str, due: Option<&str>) -> Result<(), ()> {
     if Uuid::parse_str(id).is_err() {
         return Err(());
     }
-    let url = format!("{}/auth/v1/admin/users/{id}", base_url(auth));
-    let current = admin_request(auth, reqwest::Method::GET, &url)
-        .send()
-        .await
-        .map_err(|err| tracing::warn!("leer usuario: {err}"))?;
-    if !current.status().is_success() {
-        tracing::warn!("leer usuario status {}", current.status());
-        return Err(());
-    }
-    let body: Value = current.json().await.map_err(|err| tracing::warn!("leer usuario json: {err}"))?;
-    let mut meta = body.get("app_metadata").cloned().unwrap_or_else(|| json!({}));
-    let Some(object) = meta.as_object_mut() else {
-        return Err(());
+    let url = format!("{}/rest/v1/account_deletion_requests", base_url(auth));
+    let sent = match due {
+        Some(due) => admin_request(auth, reqwest::Method::POST, &url)
+            .query(&[("on_conflict", "user_id")])
+            .header("Prefer", "resolution=merge-duplicates,return=minimal")
+            .json(&json!({ "user_id": id, "due_at": due }))
+            .send()
+            .await,
+        None => admin_request(auth, reqwest::Method::DELETE, &url)
+            .query(&[("user_id", format!("eq.{id}"))])
+            .send()
+            .await,
     };
-    match due {
-        Some(due) => {
-            object.insert("deletion_due".into(), Value::String(due.to_string()));
-        }
-        None => {
-            object.remove("deletion_due");
-        }
-    }
-    let response = admin_request(auth, reqwest::Method::PUT, &url)
-        .json(&json!({ "app_metadata": meta }))
-        .send()
-        .await
-        .map_err(|err| tracing::warn!("actualizar deletion_due: {err}"))?;
+    let response = sent.map_err(|err| tracing::warn!("solicitud de eliminación: {err}"))?;
     if response.status().is_success() {
         Ok(())
     } else {
-        tracing::warn!("actualizar deletion_due status {}", response.status());
+        tracing::warn!("solicitud de eliminación status {}", response.status());
         Err(())
     }
 }
 
-pub async fn purge_scheduled_deletions(auth: &AuthState) {
-    let now = OffsetDateTime::now_utc();
-    let mut due_ids = Vec::new();
-    let mut page = 1u32;
-    loop {
-        let url = format!("{}/auth/v1/admin/users?page={page}&per_page=200", base_url(auth));
-        let response = match admin_request(auth, reqwest::Method::GET, &url).send().await {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::warn!("no se pudieron listar usuarios: {err}");
-                return;
-            }
-        };
-        if !response.status().is_success() {
-            tracing::warn!("listar usuarios respondió {}", response.status());
-            return;
-        }
-        let body: Value = match response.json().await {
-            Ok(body) => body,
-            Err(err) => {
-                tracing::warn!("respuesta de usuarios inválida: {err}");
-                return;
-            }
-        };
-        let Some(users) = body.get("users").and_then(Value::as_array) else {
-            return;
-        };
-        if users.is_empty() {
-            break;
-        }
-        for user in users {
-            let Some(due) = user.pointer("/app_metadata/deletion_due").and_then(Value::as_str) else {
-                continue;
-            };
-            let Ok(when) = OffsetDateTime::parse(due, &Rfc3339) else {
-                continue;
-            };
-            if when > now {
-                continue;
-            }
-            let Some(id) = user.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            if Uuid::parse_str(id).is_ok() {
-                due_ids.push(id.to_string());
-            }
-        }
-        if users.len() < 200 || page >= 500 {
-            break;
-        }
-        page += 1;
+/// Fecha de eliminación programada del usuario, si existe.
+async fn read_deletion_due(auth: &AuthState, id: &str) -> Result<Option<String>, ()> {
+    if Uuid::parse_str(id).is_err() {
+        return Err(());
     }
+    let url = format!("{}/rest/v1/account_deletion_requests", base_url(auth));
+    let response = admin_request(auth, reqwest::Method::GET, &url)
+        .query(&[("select", "due_at"), ("user_id", &format!("eq.{id}")), ("limit", "1")])
+        .send()
+        .await
+        .map_err(|err| tracing::warn!("leer solicitud de eliminación: {err}"))?;
+    if !response.status().is_success() {
+        tracing::warn!("leer solicitud de eliminación status {}", response.status());
+        return Err(());
+    }
+    let rows: Value = response.json().await.map_err(|err| tracing::warn!("solicitud json: {err}"))?;
+    Ok(rows
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("due_at"))
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
 
-    for id in due_ids {
+pub async fn deletion_status(State(auth): State<AuthState>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(user_id) = caller_id(&auth, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "Tenés que iniciar sesión.");
+    };
+    match read_deletion_due(&auth, &user_id).await {
+        Ok(due_at) => (StatusCode::OK, Json(json!({ "ok": true, "due_at": due_at }))).into_response(),
+        Err(()) => err(StatusCode::BAD_GATEWAY, "No se pudo leer el estado de la cuenta."),
+    }
+}
+
+/// Borra las cuentas cuya solicitud venció. Lee solo `account_deletion_requests`
+/// (lotes de 200), en vez de recorrer todos los usuarios de Auth.
+pub async fn purge_scheduled_deletions(auth: &AuthState) {
+    let url = format!("{}/rest/v1/account_deletion_requests", base_url(auth));
+    let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default();
+    let due_filter = format!("lte.{now}");
+    let response = match admin_request(auth, reqwest::Method::GET, &url)
+        .query(&[("select", "user_id"), ("due_at", due_filter.as_str()), ("limit", "200")])
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!("no se pudieron leer las eliminaciones vencidas: {err}");
+            return;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!("leer eliminaciones vencidas status {}", response.status());
+        return;
+    }
+    let rows: Value = match response.json().await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!("eliminaciones vencidas json: {err}");
+            return;
+        }
+    };
+    let ids: Vec<String> = rows
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get("user_id").and_then(Value::as_str))
+                .filter(|id| Uuid::parse_str(id).is_ok())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in ids {
         delete_user_data(auth, &id).await;
     }
 }
